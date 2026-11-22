@@ -26,7 +26,7 @@ load_dotenv()
 if os.getenv("GEMINI_API_KEY") and not os.getenv("GOOGLE_API_KEY"):
     os.environ["GOOGLE_API_KEY"] = os.environ["GEMINI_API_KEY"]
 
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 READ_TOOLS = [list_repo_files, read_repo_file]
 CODER_WRITE_TOOLS = [write_product_file, edit_product_file]
 
