@@ -9,6 +9,17 @@ This repository deliberately separates two systems:
 
 The goal is not to build the fanciest application. The goal is to engineer a repeatable **Human + AI Software Factory** that can transform a Change Request into verifiable software evidence.
 
+## Team & Human Roles
+
+Humans act as explicit, auditable decision gates (`scripts/approve_gate.py`). Automated agents never self-approve or merge automatically (`READY FOR HUMAN MERGE` is the maximum automated state).
+
+| Role | Team Member | Gate | Responsibilities |
+|---|---|---|---|
+| **Product Owner (PO)** | Giuseph Alexis Chan Torres | `requirements` | Validates functional scope against `docs/REQUIREMENTS.md` and resolves ambiguous Change Requests (e.g., `CR-005`). |
+| **Tech Lead (TL)** | Aldrin Enrique Novelo Góngora | `plan` | Reviews `02-plan.md` for architecture compliance (`API -> Service -> Repository`) and approves before `CoderAgent` runs. |
+| **Human Reviewer (HR)** | Erick Ricardo Vega Nolasco | `review` | Triages findings from `ReviewerAgent` and `SecurityAgent` (accept `MUST FIX`, defer, or reject). |
+| **Release Manager (RM)** | Aldrin Enrique Novelo Góngora *(rotates with Giuseph & Erick)* | `release` | Audits traceability (`traceability.md`, `factory-run.json`) and records the final release decision (`READY FOR HUMAN MERGE`). |
+
 ## Reference stack
 
 - Python 3.11+
