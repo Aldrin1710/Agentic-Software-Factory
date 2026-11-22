@@ -5,6 +5,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 READABLE_ROOTS = {"docs", "change_requests", "campusflow", "tests", "runs"}
+BINARY_EXTENSIONS = {".db", ".png", ".jpg", ".jpeg", ".zip", ".pdf", ".docx"}
 
 
 def _safe_repo_path(relative_path: str) -> Path:
@@ -12,6 +13,21 @@ def _safe_repo_path(relative_path: str) -> Path:
     if REPO_ROOT not in candidate.parents and candidate != REPO_ROOT:
         raise ValueError("path escapes repository")
     return candidate
+
+
+def _is_allowed_product_write(rel: Path) -> bool:
+    """Allow writes strictly under campusflow/ or tests/product/."""
+    if not rel.parts:
+        return False
+    if any(part.startswith(".") for part in rel.parts):
+        return False
+    if rel.suffix.lower() in BINARY_EXTENSIONS:
+        return False
+    if rel.parts[0] == "campusflow":
+        return len(rel.parts) >= 2
+    if rel.parts[0] == "tests":
+        return len(rel.parts) >= 3 and rel.parts[1] == "product"
+    return False
 
 
 def list_repo_files(prefix: str = "") -> dict:
@@ -88,3 +104,56 @@ def write_run_evidence(change_id: str, filename: str, content: str) -> dict:
     path = folder / filename
     path.write_text(content, encoding="utf-8")
     return {"ok": True, "path": str(path.relative_to(REPO_ROOT))}
+
+
+def write_product_file(relative_path: str, content: str) -> dict:
+    """Bounded write tool for CoderAgent: strictly limited to campusflow/ and tests/product/."""
+    try:
+        path = _safe_repo_path(relative_path)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    rel = path.relative_to(REPO_ROOT)
+    if not _is_allowed_product_write(rel):
+        return {
+            "ok": False,
+            "error": (
+                f"write not allowed for {str(rel)!r}; "
+                "CoderAgent may only edit files under 'campusflow/' or 'tests/product/'"
+            ),
+        }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    return {"ok": True, "path": str(rel), "bytes_written": len(content.encode("utf-8"))}
+
+
+def edit_product_file(relative_path: str, old_text: str, new_text: str) -> dict:
+    """Bounded edit tool for CoderAgent: replaces an exact unique snippet in product/test code."""
+    if not old_text:
+        return {"ok": False, "error": "old_text must be non-empty"}
+    try:
+        path = _safe_repo_path(relative_path)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    rel = path.relative_to(REPO_ROOT)
+    if not _is_allowed_product_write(rel):
+        return {
+            "ok": False,
+            "error": (
+                f"edit not allowed for {str(rel)!r}; "
+                "CoderAgent may only edit files under 'campusflow/' or 'tests/product/'"
+            ),
+        }
+    if not path.is_file():
+        return {"ok": False, "error": f"file does not exist: {str(rel)!r}"}
+    original = path.read_text(encoding="utf-8")
+    occurrences = original.count(old_text)
+    if occurrences == 0:
+        return {"ok": False, "error": "old_text not found in file"}
+    if occurrences > 1:
+        return {
+            "ok": False,
+            "error": f"old_text matched {occurrences} times; provide more surrounding context",
+        }
+    updated = original.replace(old_text, new_text, 1)
+    path.write_text(updated, encoding="utf-8")
+    return {"ok": True, "path": str(rel)}

@@ -16,7 +16,11 @@ INTAKE_INSTRUCTION = COMMON_RULES + """
 ROLE: Intake Agent (read-only).
 Turn the active Change Request into a bounded intake report.
 Identify requested outcome, relevant requirements/AC, ambiguity/conflict,
-likely repository areas, and recommend PROCEED or HUMAN_CLARIFICATION_REQUIRED.
+and likely repository areas.
+End your report with an exact standalone line containing either:
+RECOMMENDATION: PROCEED
+or
+RECOMMENDATION: HUMAN_CLARIFICATION_REQUIRED
 Do not design the implementation. Do not modify files.
 """
 
@@ -25,15 +29,19 @@ ROLE: Planner Agent (read-only).
 Use the intake report and repository context to propose an implementation plan.
 Include scope, requirements/AC, likely files, tests, architecture constraints,
 security considerations, verification commands, assumptions/open questions.
-If ambiguity remains, STOP and request human clarification. Do not write code.
+If the intake report recommends HUMAN_CLARIFICATION_REQUIRED or ambiguity remains,
+output STOP: HUMAN_CLARIFICATION_REQUIRED and request human clarification instead of
+inventing policy. Do not write code.
 """
 
 CODER_INSTRUCTION = COMMON_RULES + """
 ROLE: Coder Agent.
 Implement only a human-approved plan.
-The starter intentionally grants no write tool yet. Students must design bounded
-write/edit capability before enabling autonomous implementation.
-Do not self-approve.
+Your write/edit tools (`write_product_file`, `edit_product_file`) are strictly
+bounded to `campusflow/` and `tests/product/`.
+Keep business rules in `campusflow/service.py` (never in API or Repository).
+Add deterministic tests for every new or changed rule without weakening existing tests.
+Summarize exact files changed and remaining risks. Do not self-approve.
 """
 
 TEST_ANALYST_INSTRUCTION = COMMON_RULES + """

@@ -1,5 +1,6 @@
 import os
 
+from dotenv import load_dotenv
 from google.adk.agents.llm_agent import LlmAgent
 
 from .prompts import (
@@ -11,13 +12,23 @@ from .prompts import (
     SECURITY_INSTRUCTION,
     TEST_ANALYST_INSTRUCTION,
 )
-from .tools import list_repo_files, read_repo_file, run_baseline_verification, write_run_evidence
+from .tools import (
+    edit_product_file,
+    list_repo_files,
+    read_repo_file,
+    run_baseline_verification,
+    write_product_file,
+    write_run_evidence,
+)
+
+load_dotenv()
 
 if os.getenv("GEMINI_API_KEY") and not os.getenv("GOOGLE_API_KEY"):
     os.environ["GOOGLE_API_KEY"] = os.environ["GEMINI_API_KEY"]
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 READ_TOOLS = [list_repo_files, read_repo_file]
+CODER_WRITE_TOOLS = [write_product_file, edit_product_file]
 
 intake_agent = LlmAgent(
     name="IntakeAgent",
@@ -40,9 +51,12 @@ planner_agent = LlmAgent(
 coder_agent = LlmAgent(
     name="CoderAgent",
     model=GEMINI_MODEL,
-    description="Implements an approved plan. Write tooling is intentionally absent in starter.",
+    description=(
+        "Implements a human-approved plan with write tools bounded to campusflow/ "
+        "and tests/product/."
+    ),
     instruction=CODER_INSTRUCTION,
-    tools=READ_TOOLS,
+    tools=[*READ_TOOLS, *CODER_WRITE_TOOLS],
     output_key="coder_report",
 )
 
