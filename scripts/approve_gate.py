@@ -1,52 +1,59 @@
 from __future__ import annotations
 
-import json
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-VALID_GATES = {"requirements", "plan", "review", "release"}
-VALID_DECISIONS = {"APPROVED", "MODIFIED", "REJECTED", "DEFERRED"}
-GATE_OWNERS = {
-    "requirements": "Giuseph Alexis Chan Torres (Product Owner)",
-    "plan": "Aldrin Enrique Novelo Góngora (Tech Lead)",
-    "review": "Erick Ricardo Vega Nolasco (Human Reviewer)",
-    "release": "Aldrin Enrique Novelo Góngora (Release Manager)",
-}
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from factory_app.gates import (  # noqa: E402
+    GATE_OWNERS,
+    VALID_DECISIONS,
+    VALID_GATES,
+    GateBlockedError,
+    record_gate_decision,
+)
+from factory_app.state import RUNS_DIR  # noqa: E402
+
+__all__ = ["GATE_OWNERS", "VALID_DECISIONS", "VALID_GATES", "main"]
 
 
-def main() -> None:
-    if len(sys.argv) < 5:
+def main(argv: list[str] | None = None, *, runs_dir: Path | None = None) -> Path:
+    args = sys.argv[1:] if argv is None else argv
+    if len(args) < 4:
         raise SystemExit('Usage: python scripts/approve_gate.py CR-001 plan APPROVED "reason"')
-    change_id = sys.argv[1].upper()
-    gate = sys.argv[2].lower()
-    decision = sys.argv[3].upper()
-    reason = " ".join(sys.argv[4:]).strip()
+    change_id = args[0].strip().upper()
+    gate = args[1].strip().lower()
+    decision = args[2].strip().upper()
+    reason = " ".join(args[3:]).strip()
     if gate not in VALID_GATES:
         raise SystemExit(f"Invalid gate: {sorted(VALID_GATES)}")
     if decision not in VALID_DECISIONS:
         raise SystemExit(f"Invalid decision: {sorted(VALID_DECISIONS)}")
     if not reason:
         raise SystemExit("Human decision requires a reason")
-    run = ROOT / "runs" / change_id
-    state_path = run / "factory-state.json"
-    if not state_path.exists():
-        raise SystemExit(f"Run not found: {change_id}")
-    state = json.loads(state_path.read_text(encoding="utf-8"))
-    state["human_gates"][gate] = decision
-    state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
-    evidence = {
-        "change_id": change_id,
-        "gate": gate,
-        "decision": decision,
-        "reason": reason,
-        "recorded_at": datetime.now(timezone.utc).isoformat(),
-        "recorded_by": GATE_OWNERS[gate],
-    }
-    path = run / f"human-{gate}-decision.json"
-    path.write_text(json.dumps(evidence, indent=2), encoding="utf-8")
-    print(f"Recorded {gate}: {decision} -> {path.relative_to(ROOT)}")
+
+    target_runs_dir = runs_dir or RUNS_DIR
+    try:
+        _, path = record_gate_decision(
+            change_id,
+            gate,
+            decision,
+            reason,
+            runs_dir=target_runs_dir,
+        )
+    except FileNotFoundError as exc:
+        raise SystemExit(f"Run not found: {change_id}") from exc
+    except (ValueError, GateBlockedError) as exc:
+        raise SystemExit(f"BLOCKED BY HUMAN GATE: {exc}") from exc
+
+    try:
+        display_path = path.relative_to(ROOT)
+    except ValueError:
+        display_path = path
+    print(f"Recorded {gate}: {decision} -> {display_path}")
+    return path
 
 
 if __name__ == "__main__":
