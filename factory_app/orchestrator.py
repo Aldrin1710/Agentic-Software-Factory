@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import os
 import re
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -50,12 +52,18 @@ def parse_intake_recommendation(report: str) -> str:
     return "HUMAN_CLARIFICATION_REQUIRED"
 
 
-async def run_adk_agent(
+def _is_rate_limit_error(exc: BaseException) -> bool:
+    """Detect Gemini API rate-limit / quota exhaustion errors eligible for backoff retry."""
+    message = f"{type(exc).__name__}: {exc}".lower()
+    markers = ("429", "resource_exhausted", "rate limit", "too many requests", "quota")
+    return any(marker in message for marker in markers)
+
+
+async def _run_adk_agent_once(
     agent: Any,
     prompt: str,
     initial_state: dict[str, Any] | None = None,
 ) -> str:
-    """Run a single Google ADK LlmAgent in an isolated InMemoryRunner session."""
     app_name = "campusflow_factory"
     user_id = "factory_orchestrator"
     runner = InMemoryRunner(agent=agent, app_name=app_name)
@@ -87,6 +95,28 @@ async def run_adk_agent(
     if updated and output_key and updated.state.get(output_key):
         return str(updated.state[output_key]).strip()
     return "\n".join(chunks).strip()
+
+
+async def run_adk_agent(
+    agent: Any,
+    prompt: str,
+    initial_state: dict[str, Any] | None = None,
+) -> str:
+    """Run a single Google ADK LlmAgent in an isolated session with 429 backoff retry."""
+    max_attempts = max(1, int(os.getenv("GEMINI_RETRY_ATTEMPTS", "3")))
+    base_delay = max(0.0, float(os.getenv("GEMINI_RETRY_BASE_DELAY", "2.0")))
+
+    last_exc: Exception | None = None
+    for attempt in range(max_attempts):
+        try:
+            return await _run_adk_agent_once(agent, prompt, initial_state)
+        except Exception as exc:
+            if not _is_rate_limit_error(exc) or attempt + 1 >= max_attempts:
+                raise
+            last_exc = exc
+            await asyncio.sleep(base_delay * (2**attempt))
+
+    raise RuntimeError("Agent execution failed after retries") from last_exc
 
 
 async def run_planning(
