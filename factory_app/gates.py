@@ -197,3 +197,34 @@ def require_plan_approved(change_id: str, *, runs_dir: Path = RUNS_DIR) -> dict:
     return require_human_gate(
         normalized_id, "plan", allowed_decisions={"APPROVED"}, runs_dir=runs_dir
     )
+
+
+def require_verification_passed(
+    change_id: str,
+    *,
+    runs_dir: Path = RUNS_DIR,
+    report_filename: str = "05-verification.txt",
+) -> Path:
+    """Block downstream review/release unless deterministic verification passed with evidence."""
+    normalized_id = change_id.strip().upper()
+    state = load_state(normalized_id, runs_dir=runs_dir)
+    if state.get("status") == "VERIFICATION_FAILED" or state.get("verification") != "PASS":
+        raise GateBlockedError(
+            f"Deterministic verification has not passed for {normalized_id} "
+            f"(status={state.get('status')!r}, verification={state.get('verification')!r})."
+        )
+
+    report_path = get_run_dir(normalized_id, runs_dir=runs_dir) / report_filename
+    if not report_path.is_file():
+        raise GateBlockedError(
+            f"Missing deterministic verification artifact {report_filename!r} for {normalized_id}."
+        )
+
+    content = report_path.read_text(encoding="utf-8")
+    if "OVERALL: FAIL" in content or "OVERALL: PASS" not in content:
+        raise GateBlockedError(
+            f"Verification artifact {report_filename!r} for {normalized_id} "
+            f"does not confirm deterministic OVERALL: PASS."
+        )
+
+    return report_path

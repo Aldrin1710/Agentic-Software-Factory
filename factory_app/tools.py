@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -74,8 +75,17 @@ def read_repo_file(relative_path: str) -> dict:
 def run_baseline_verification() -> dict:
     """Run an allowlisted deterministic baseline. No arbitrary shell input."""
     commands = [
-        ["python", "-m", "pytest", "-q"],
-        ["python", "-m", "ruff", "check", "campusflow", "tests", "factory_app", "scripts"],
+        [sys.executable, "-m", "pytest", "-q"],
+        [
+            sys.executable,
+            "-m",
+            "ruff",
+            "check",
+            "campusflow",
+            "tests",
+            "factory_app",
+            "scripts",
+        ],
     ]
     results = []
     all_ok = True
@@ -91,6 +101,35 @@ def run_baseline_verification() -> dict:
             "stderr": completed.stderr[-3000:],
         })
     return {"ok": all_ok, "results": results}
+
+
+def get_git_diff(
+    paths: tuple[str, ...] = ("campusflow", "tests"),
+    *,
+    max_chars: int = 12_000,
+) -> dict:
+    """Return a bounded read-only git diff for allowlisted repo paths to save LLM tokens."""
+    safe_paths = [p for p in paths if p in READABLE_ROOTS]
+    cmd = ["git", "diff", "HEAD", "--", *safe_paths] if safe_paths else ["git", "diff", "HEAD"]
+    completed = subprocess.run(
+        cmd, cwd=REPO_ROOT, text=True, capture_output=True, timeout=30, check=False
+    )
+    if completed.returncode != 0:
+        fallback = ["git", "diff", "--", *safe_paths] if safe_paths else ["git", "diff"]
+        completed = subprocess.run(
+            fallback, cwd=REPO_ROOT, text=True, capture_output=True, timeout=30, check=False
+        )
+    diff_text = completed.stdout or ""
+    truncated = False
+    if len(diff_text) > max_chars:
+        diff_text = diff_text[:max_chars] + "\n...[TRUNCATED FOR TOKEN BUDGET]..."
+        truncated = True
+    return {
+        "ok": completed.returncode == 0,
+        "diff": diff_text,
+        "truncated": truncated,
+        "stderr": (completed.stderr or "")[-1000:],
+    }
 
 
 def write_run_evidence(change_id: str, filename: str, content: str) -> dict:
