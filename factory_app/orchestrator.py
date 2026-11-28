@@ -11,10 +11,25 @@ from google.adk.runners import InMemoryRunner
 from google.genai import types
 
 from .agents import coder_agent, intake_agent, planner_agent
-from .gates import require_plan_approved
-from .state import CR_DIR, REPO_ROOT, RUNS_DIR, init_run, transition_state
+from .gates import GATE_OWNERS, record_gate_decision, require_plan_approved
+from .state import CR_DIR, REPO_ROOT, RUNS_DIR, get_run_dir, init_run, load_state, transition_state
 
 AgentRunnerFn = Callable[[Any, str, dict[str, Any] | None], Awaitable[str]]
+GatePromptFn = Callable[[str, str, str], tuple[str, str]]
+
+PAUSE_GATE_MAP: dict[str, tuple[str, str]] = {
+    "CLARIFICATION_REQUIRED": ("requirements", "01-intake-report.md"),
+    "AWAITING_PLAN_APPROVAL": ("plan", "02-plan.md"),
+    "AWAITING_HUMAN_REVIEW": ("review", "06-review-report.md"),
+    "AWAITING_RELEASE_GATE": ("release", "traceability.md"),
+}
+
+TERMINAL_OR_BLOCKED_STATUSES = {
+    "PLAN_REJECTED",
+    "VERIFICATION_FAILED",
+    "RELEASE_BLOCKED",
+    "READY_FOR_HUMAN_MERGE",
+}
 
 INTAKE_CONTEXT_DOCS = ("docs/REQUIREMENTS.md", "docs/SPEC.md", "docs/REPO_MAP.md")
 PLANNER_CONTEXT_DOCS = (
@@ -22,6 +37,14 @@ PLANNER_CONTEXT_DOCS = (
     "docs/SPEC.md",
     "docs/ARCHITECTURE.md",
     "docs/REPO_MAP.md",
+)
+CODER_CONTEXT_FILES = (
+    "campusflow/domain.py",
+    "campusflow/errors.py",
+    "campusflow/repository.py",
+    "campusflow/service.py",
+    "campusflow/api.py",
+    "tests/product/test_service.py",
 )
 
 
@@ -97,6 +120,19 @@ async def _run_adk_agent_once(
     return "\n".join(chunks).strip()
 
 
+def _extract_retry_delay(exc: BaseException, fallback: float) -> float:
+    """Honor Gemini API retryDelay hint (e.g. 'retryDelay': '35s') when present."""
+    if fallback == 0.0:
+        return 0.0
+    text = str(exc)
+    match = re.search(r"retry\s+in\s+(\d+(?:\.\d+)?)s", text, re.IGNORECASE) or re.search(
+        r"retryDelay['\"]?\s*:\s*['\"]?(\d+(?:\.\d+)?)s", text, re.IGNORECASE
+    )
+    if match:
+        return min(65.0, float(match.group(1)) + 1.0)
+    return fallback
+
+
 async def run_adk_agent(
     agent: Any,
     prompt: str,
@@ -114,7 +150,8 @@ async def run_adk_agent(
             if not _is_rate_limit_error(exc) or attempt + 1 >= max_attempts:
                 raise
             last_exc = exc
-            await asyncio.sleep(base_delay * (2**attempt))
+            delay = _extract_retry_delay(exc, base_delay * (2**attempt))
+            await asyncio.sleep(delay)
 
     raise RuntimeError("Agent execution failed after retries") from last_exc
 
@@ -234,14 +271,18 @@ async def run_coder(
 
     transition_state(normalized, "IMPLEMENTING", runs_dir=runs_dir)
 
+    coder_context = _load_repo_context(CODER_CONTEXT_FILES)
     coder_prompt = (
         f"Implement the human-approved plan for {normalized}. "
         f"Use bounded tools only under campusflow/ and tests/product/. "
-        f"Never modify docs/REQUIREMENTS.md or docs/SPEC.md and never weaken tests.\n\n"
+        f"Never modify docs/REQUIREMENTS.md or docs/SPEC.md and never weaken tests. "
+        f"The current product and test files are already provided below; do NOT call "
+        f"`list_repo_files` or `read_repo_file` for files already shown here.\n\n"
         f"Human plan approval: {decision.get('decision')} by {decision.get('recorded_by')} "
         f"({decision.get('reason')})\n\n"
         f"Change Request:\n{cr_text}\n\n"
-        f"Approved Plan:\n{plan_text}"
+        f"Approved Plan:\n{plan_text}\n\n"
+        f"Current Product & Test Files:\n{coder_context}"
     )
     coder_report = await agent_runner(coder_agent, coder_prompt, None)
     coder_path = run_dir / "04-coder-report.md"
@@ -253,4 +294,161 @@ async def run_coder(
         "status": state["status"],
         "coder_report": str(coder_path),
         "plan_decision": decision,
+    }
+
+
+def default_console_gate_prompt(change_id: str, gate: str, artifact_rel: str) -> tuple[str, str]:
+    """Prompt the human gate owner interactively in the terminal."""
+    owner = GATE_OWNERS.get(gate, "Human Owner")
+    print(f"\n=== HUMAN GATE: {gate.upper()} ({change_id}) ===")
+    print(f"Owner   : {owner}")
+    print(f"Review  : {artifact_rel}")
+    decision = (
+        input("Decision [APPROVED / MODIFIED / REJECTED / DEFERRED / PAUSE]: ").strip().upper()
+    )
+    if not decision or decision == "PAUSE":
+        return "PAUSE", ""
+    reason = input("Reason (required): ").strip()
+    return decision, reason
+
+
+async def run_factory(
+    change_id: str,
+    *,
+    runs_dir: Path = RUNS_DIR,
+    cr_dir: Path = CR_DIR,
+    agent_runner: AgentRunnerFn = run_adk_agent,
+    verifier: Callable[[], dict[str, Any]] | None = None,
+    diff_provider: Callable[[], dict[str, Any]] | None = None,
+    run_test_analyst: bool = True,
+    interactive: bool = False,
+    prompt_fn: GatePromptFn = default_console_gate_prompt,
+    max_steps: int = 10,
+) -> dict[str, Any]:
+    """Master pause/resume orchestrator driven by runs/<CR-ID>/factory-state.json."""
+    from .review import run_independent_review
+    from .tools import get_git_diff, run_baseline_verification
+    from .verification import run_verification
+
+    active_verifier = verifier or run_baseline_verification
+    active_diff_provider = diff_provider or get_git_diff
+
+    normalized = change_id.strip().upper()
+    run_dir = get_run_dir(normalized, runs_dir=runs_dir)
+    if not (run_dir / "factory-state.json").is_file():
+        init_run(normalized, runs_dir=runs_dir, cr_dir=cr_dir)
+
+    executed_steps: list[str] = []
+
+    for _ in range(max_steps):
+        state = load_state(normalized, runs_dir=runs_dir)
+        status = state.get("status", "INTAKE_PENDING")
+
+        if status in TERMINAL_OR_BLOCKED_STATUSES:
+            return {
+                "change_id": normalized,
+                "status": status,
+                "paused": False,
+                "executed_steps": executed_steps,
+                "message": f"Factory stopped at status {status}.",
+            }
+
+        if status in PAUSE_GATE_MAP:
+            gate, artifact = PAUSE_GATE_MAP[status]
+            artifact_path = str(run_dir / artifact)
+            if not interactive:
+                return {
+                    "change_id": normalized,
+                    "status": status,
+                    "paused": True,
+                    "waiting_gate": gate,
+                    "gate_owner": GATE_OWNERS.get(gate, "Human Owner"),
+                    "review_artifact": artifact_path,
+                    "executed_steps": executed_steps,
+                    "next_action": (
+                        f'python scripts/approve_gate.py {normalized} {gate} APPROVED "<reason>"'
+                    ),
+                }
+
+            decision, reason = prompt_fn(normalized, gate, artifact_path)
+            if decision == "PAUSE":
+                return {
+                    "change_id": normalized,
+                    "status": status,
+                    "paused": True,
+                    "waiting_gate": gate,
+                    "gate_owner": GATE_OWNERS.get(gate, "Human Owner"),
+                    "review_artifact": artifact_path,
+                    "executed_steps": executed_steps,
+                    "next_action": (
+                        f'python scripts/approve_gate.py {normalized} {gate} APPROVED "<reason>"'
+                    ),
+                }
+
+            record_gate_decision(
+                normalized,
+                gate,
+                decision,
+                reason,
+                runs_dir=runs_dir,
+            )
+            executed_steps.append(f"human_gate:{gate}:{decision}")
+            continue
+
+        if status in {"INTAKE_PENDING", "PLANNING"}:
+            await run_planning(
+                normalized,
+                runs_dir=runs_dir,
+                cr_dir=cr_dir,
+                agent_runner=agent_runner,
+            )
+            executed_steps.append("planning")
+            continue
+
+        if status == "IMPLEMENTING":
+            await run_coder(
+                normalized,
+                runs_dir=runs_dir,
+                agent_runner=agent_runner,
+            )
+            executed_steps.append("coder")
+            continue
+
+        if status == "VERIFICATION_RUNNING":
+            await run_verification(
+                normalized,
+                runs_dir=runs_dir,
+                verifier=active_verifier,
+                agent_runner=agent_runner,
+                diff_provider=active_diff_provider,
+                run_test_analyst=run_test_analyst,
+            )
+            executed_steps.append("verification")
+            continue
+
+        if status == "INDEPENDENT_REVIEW":
+            await run_independent_review(
+                normalized,
+                runs_dir=runs_dir,
+                agent_runner=agent_runner,
+                diff_provider=active_diff_provider,
+            )
+            executed_steps.append("independent_review")
+            continue
+
+        return {
+            "change_id": normalized,
+            "status": status,
+            "paused": True,
+            "executed_steps": executed_steps,
+            "message": f"Stage {status!r} reached; awaiting downstream handler.",
+        }
+
+    final_state = load_state(normalized, runs_dir=runs_dir)
+    return {
+        "change_id": normalized,
+        "status": final_state.get("status"),
+        "paused": True,
+        "executed_steps": executed_steps,
+        "message": f"Stopped after reaching max_steps={max_steps}.",
     }
